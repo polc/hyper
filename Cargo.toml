@@ -23,7 +23,7 @@ include = [
 bytes = "0.5"
 futures-core = { version = "0.3", default-features = false }
 futures-channel = "0.3"
-futures-util = { version = "0.3", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 http = "0.2"
 http-body = "0.3.1"
 httparse = "1.0"

@@ -3,6 +3,8 @@ use std::marker::Unpin;
 #[cfg(feature = "runtime")]
 use std::time::Duration;
 
+use futures_core::Stream;
+use futures_util::stream::FuturesUnordered;
 use h2::server::{Connection, Handshake, SendResponse};
 use h2::Reason;
 use pin_project::pin_project;
@@ -66,6 +68,7 @@ where
     exec: E,
     service: S,
     state: State<T, B>,
+    streams: FuturesUnordered<Streams<S::Future, B>>,
 }
 
 enum State<T, B>
@@ -87,6 +90,7 @@ where
     ping: Option<(ping::Recorder, ping::Ponger)>,
     conn: Connection<T, SendBuf<B::Data>>,
     closing: Option<crate::Error>,
+    hack_stream_channels: bool,
 }
 
 impl<T, S, B, E> Server<T, S, B, E>
@@ -133,6 +137,7 @@ where
                 hs: handshake,
             },
             service,
+            streams: FuturesUnordered::new(),
         }
     }
 
@@ -162,6 +167,7 @@ where
     S: HttpService<Body, ResBody = B>,
     S::Error: Into<Box<dyn StdError + Send + Sync>>,
     B: HttpBody + 'static,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
     E: H2Exec<S::Future, B>,
 {
     type Output = crate::Result<Dispatched>;
@@ -185,10 +191,11 @@ where
                         ping,
                         conn,
                         closing: None,
+                        hack_stream_channels: true,
                     })
                 }
                 State::Serving(ref mut srv) => {
-                    ready!(srv.poll_server(cx, &mut me.service, &mut me.exec))?;
+                    ready!(srv.poll_server(cx, &mut me.service, &mut me.streams, &mut me.exec))?;
                     return Poll::Ready(Ok(Dispatched::Shutdown));
                 }
                 State::Closed => {
@@ -211,16 +218,28 @@ where
         &mut self,
         cx: &mut task::Context<'_>,
         service: &mut S,
+        streams: &mut FuturesUnordered<Streams<S::Future, B>>,
         exec: &mut E,
     ) -> Poll<crate::Result<()>>
     where
         S: HttpService<Body, ResBody = B>,
         S::Error: Into<Box<dyn StdError + Send + Sync>>,
         E: H2Exec<S::Future, B>,
+        Streams<S::Future, B>: Future<Output = ()>,
     {
         if self.closing.is_none() {
             loop {
                 self.poll_ping(cx);
+
+                // XXX: hack hack hack
+                // Check the Streams bundle
+                'streams: loop {
+                    match Pin::new(&mut *streams).poll_next(cx) {
+                        Poll::Ready(Some(())) => (),
+                        Poll::Ready(None) | Poll::Pending => break 'streams,
+                    }
+                }
+
 
                 // Check that the service is ready to accept a new request.
                 //
@@ -267,9 +286,30 @@ where
                         // Record the headers received
                         ping.record_non_data();
 
-                        let req = req.map(|stream| crate::Body::h2(stream, content_length, ping));
-                        let fut = H2Stream::new(service.call(req), respond);
-                        exec.execute_h2stream(fut);
+                        if self.hack_stream_channels {
+                            let req = req.map(|stream| {
+                                let mut bd = crate::Body::h2(stream, content_length, ping);
+                                let (mut tx, rx) = tokio::sync::mpsc::channel(1);
+
+                                streams.push(Streams::Req(Box::pin(async move {
+                                    while let Some(item) = bd.data().await {
+                                        match tx.send(item).await {
+                                            Ok(()) => (),
+                                            Err(_) => break,
+                                        }
+                                    }
+                                })));
+
+
+                                crate::Body::wrap_stream(rx)
+                            });
+                            let fut = H2Stream::new(service.call(req), respond);
+                            streams.push(Streams::Resp(fut));
+                        } else {
+                            let req = req.map(|stream| crate::Body::h2(stream, content_length, ping));
+                            let fut = H2Stream::new(service.call(req), respond);
+                            exec.execute_h2stream(fut);
+                        }
                     }
                     Some(Err(e)) => {
                         return Poll::Ready(Err(crate::Error::new_h2(e)));
@@ -439,5 +479,27 @@ where
                 debug!("stream error: {}", e);
             }
         })
+    }
+}
+
+enum Streams<F, B: HttpBody> {
+    Req(Pin<Box<dyn Future<Output = ()> + Send>>),
+    Resp(H2Stream<F, B>),
+}
+
+impl<F, B, E> Future for Streams<F, B>
+where
+    F: Future<Output = Result<Response<B>, E>>,
+    B: HttpBody,
+    B::Error: Into<Box<dyn StdError + Send + Sync>>,
+    E: Into<Box<dyn StdError + Send + Sync>>,
+{
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
+        match unsafe { self.get_unchecked_mut() } {
+            Streams::Req(ref mut req_stream) => req_stream.as_mut().poll(cx),
+            Streams::Resp(ref mut resp_stream) => unsafe { Pin::new_unchecked(resp_stream) }.poll(cx),
+        }
     }
 }
