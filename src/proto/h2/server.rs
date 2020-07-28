@@ -289,11 +289,19 @@ where
                         if self.hack_stream_channels {
                             let req = req.map(|stream| {
                                 let mut bd = crate::Body::h2(stream, content_length, ping);
-                                let (mut tx, rx) = tokio::sync::mpsc::channel(1);
+                                //let (mut tx, rx) = tokio::sync::mpsc::channel(1);
+                                let (mut tx, rx) = futures_channel::mpsc::channel(1);
+
+                                async fn send(tx: &mut futures_channel::mpsc::Sender<crate::Result<bytes::Bytes>>, item: crate::Result<bytes::Bytes>) -> Result <(), ()> {
+                                    futures_util::future::poll_fn(|cx| tx.poll_ready(cx)).await.map_err(|_| ())?;
+                                    tx.start_send(item).map_err(|_| ())
+
+                                }
 
                                 streams.push(Streams::Req(Box::pin(async move {
                                     while let Some(item) = bd.data().await {
-                                        match tx.send(item).await {
+                                        //match tx.send(item).await {
+                                        match send(&mut tx, item).await {
                                             Ok(()) => (),
                                             Err(_) => break,
                                         }
