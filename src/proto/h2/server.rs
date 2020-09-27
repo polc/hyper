@@ -267,7 +267,9 @@ where
                         // Record the headers received
                         ping.record_non_data();
 
-                        let req = req.map(|stream| crate::Body::h2(stream, content_length, ping));
+                        let mut req = req.map(|stream| crate::Body::h2(stream, content_length, ping));
+                        req.extensions_mut().insert(&respond);
+
                         let fut = H2Stream::new(service.call(req), respond);
                         exec.execute_h2stream(fut);
                     }
